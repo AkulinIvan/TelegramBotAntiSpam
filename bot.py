@@ -35,6 +35,9 @@ class DatabaseManager:
     def __init__(self, connection_string: str):
         self.conn_string = connection_string
         self.init_db()
+        self.recreate_table_properly()
+        self.update_database_schema()
+        self.check_table_structure()
 
     def get_connection(self) -> psycopg2.extensions.connection:
         """Создание подключения к PostgreSQL"""
@@ -120,6 +123,8 @@ class DatabaseManager:
     def get_chat_settings(self, chat_id: int) -> Optional[Dict[str, Any]]:
         """Получение настроек чата"""
         try:
+            logger.info(f"Загрузка настроек для чата {chat_id}")
+            
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
@@ -129,19 +134,57 @@ class DatabaseManager:
                     result = cursor.fetchone()
                     
                     if result:
-                        return {
-                            'chat_id': result[0],
-                            'welcome_message': str(result[1]),
-                            'min_account_age_days': int(result[2]),
-                            'min_join_date_days': int(result[3]),
-                            'restrict_new_users': bool(result[4]),
-                            'delete_service_messages': bool(result[5]),
-                            'enabled': bool(result[6]),
-                            'max_warnings': int(result[7]),
-                            'anti_flood_enabled': bool(result[8]),
-                            'protect_comments': bool(result[9]) if len(result) > 9 else True
-                        }
+                        logger.info(f"Найдены настройки в БД: {result}")
+                        logger.info(f"Количество столбцов: {len(result)}")
+                        
+                        # Анализируем структуру данных
+                        if len(result) == 11:  # Новая структура с protect_comments на позиции 9
+                            settings = {
+                                'chat_id': result[0],
+                                'welcome_message': str(result[1]),
+                                'min_account_age_days': int(result[2]),
+                                'min_join_date_days': int(result[3]),
+                                'restrict_new_users': bool(result[4]),
+                                'delete_service_messages': bool(result[5]),
+                                'enabled': bool(result[6]),
+                                'max_warnings': int(result[7]),
+                                'anti_flood_enabled': bool(result[8]),
+                                'protect_comments': bool(result[9]),  # protect_comments на позиции 9!
+                                'created_at': result[10]  # created_at на позиции 10
+                            }
+                            logger.info(f"Используем protect_comments с индекса 9: {result[9]}")
+                        elif len(result) >= 10:  # Старая структура
+                            settings = {
+                                'chat_id': result[0],
+                                'welcome_message': str(result[1]),
+                                'min_account_age_days': int(result[2]),
+                                'min_join_date_days': int(result[3]),
+                                'restrict_new_users': bool(result[4]),
+                                'delete_service_messages': bool(result[5]),
+                                'enabled': bool(result[6]),
+                                'max_warnings': int(result[7]),
+                                'anti_flood_enabled': bool(result[8]),
+                                'protect_comments': bool(result[9]) if len(result) > 9 else True
+                            }
+                        else:
+                            # Если столбцов меньше (старая структура), используем значения по умолчанию
+                            settings = {
+                                'chat_id': result[0],
+                                'welcome_message': str(result[1]) if len(result) > 1 else '👋 Добро пожаловать, {mention}! Рады видеть вас в {chat}!',
+                                'min_account_age_days': int(result[2]) if len(result) > 2 else 1,
+                                'min_join_date_days': int(result[3]) if len(result) > 3 else 0,
+                                'restrict_new_users': bool(result[4]) if len(result) > 4 else True,
+                                'delete_service_messages': bool(result[5]) if len(result) > 5 else True,
+                                'enabled': bool(result[6]) if len(result) > 6 else True,
+                                'max_warnings': int(result[7]) if len(result) > 7 else 3,
+                                'anti_flood_enabled': bool(result[8]) if len(result) > 8 else True,
+                                'protect_comments': True  # Значение по умолчанию для нового поля
+                            }
+                        
+                        logger.info(f"Загруженные настройки protect_comments: {settings.get('protect_comments')}")
+                        return settings
                     else:
+                        logger.info("Настройки не найдены, создаем по умолчанию")
                         # Создаем настройки по умолчанию
                         default_settings: Dict[str, Any] = {
                             'chat_id': chat_id,
@@ -154,7 +197,6 @@ class DatabaseManager:
                             'max_warnings': 3,
                             'anti_flood_enabled': True,
                             'protect_comments': True
-                            
                         }
                         self.save_chat_settings(default_settings)
                         return default_settings
@@ -165,13 +207,18 @@ class DatabaseManager:
     def save_chat_settings(self, settings: Dict[str, Any]) -> None:
         """Сохранение настроек чата"""
         try:
+            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, protect_comments: {settings.get('protect_comments')}")
+
+            # Сначала убедимся, что столбец существует
+            self.update_database_schema()
+
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute('''
                         INSERT INTO chat_settings 
                         (chat_id, welcome_message, min_account_age_days, min_join_date_days, 
                          restrict_new_users, delete_service_messages, enabled, max_warnings, 
-                         anti_flood_enabled)
+                         anti_flood_enabled, protect_comments)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (chat_id) DO UPDATE SET
                         welcome_message = EXCLUDED.welcome_message,
@@ -196,9 +243,18 @@ class DatabaseManager:
                         settings.get('protect_comments', True)
                     ))
                     conn.commit()
+                    logger.info("Настройки успешно сохранены в БД")
         except Exception as e:
             logger.error(f"Error saving chat settings: {e}")
-            raise
+            # Если ошибка связана с отсутствием столбца, обновляем схему и пробуем снова
+            if "protect_comments" in str(e) and "не существует" in str(e):
+                logger.info("Столбец protect_comments не существует, обновляем схему...")
+                self.update_database_schema()
+                # Пробуем сохранить снова
+                self.save_chat_settings(settings)
+            else:
+                raise
+
 
     def log_action(self, chat_id: int, user_id: Optional[int], action_type: str, details: str = "") -> None:
             """Логирование действия в статистику"""
@@ -481,6 +537,104 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error resetting flood control: {e}")
     
+    def update_database_schema(self) -> None:
+        """Обновление структуры базы данных"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Проверяем существование столбца protect_comments
+                    cursor.execute('''
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'chat_settings' AND column_name = 'protect_comments'
+                    ''')
+                    if not cursor.fetchone():
+                        # Добавляем отсутствующий столбец
+                        cursor.execute('ALTER TABLE chat_settings ADD COLUMN protect_comments BOOLEAN DEFAULT TRUE')
+                        logger.info("Added protect_comments column to chat_settings table")
+
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating database schema: {e}")
+    
+    def check_table_structure(self):
+        """Проверка структуры таблицы chat_settings"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        SELECT column_name, data_type, column_default 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'chat_settings' 
+                        ORDER BY ordinal_position
+                    ''')
+                    columns = cursor.fetchall()
+                    logger.info("Структура таблицы chat_settings:")
+                    for column in columns:
+                        logger.info(f"  {column[0]} ({column[1]}) - default: {column[2]}")
+        except Exception as e:
+            logger.error(f"Error checking table structure: {e}")
+    
+    def recreate_table_properly(self):
+        """Полное пересоздание таблицы с правильной структурой"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Создаем временную таблицу с правильной структурой
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS chat_settings_temp (
+                            chat_id BIGINT PRIMARY KEY,
+                            welcome_message TEXT DEFAULT '👋 Добро пожаловать, {mention}! Рады видеть вас в {chat}!',
+                            min_account_age_days INTEGER DEFAULT 1,
+                            min_join_date_days INTEGER DEFAULT 0,
+                            restrict_new_users BOOLEAN DEFAULT TRUE,
+                            delete_service_messages BOOLEAN DEFAULT TRUE,
+                            enabled BOOLEAN DEFAULT TRUE,
+                            max_warnings INTEGER DEFAULT 3,
+                            anti_flood_enabled BOOLEAN DEFAULT TRUE,
+                            protect_comments BOOLEAN DEFAULT TRUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+
+                    # Копируем данные из старой таблицы (если она существует)
+                    try:
+                        cursor.execute('''
+                            INSERT INTO chat_settings_temp 
+                            (chat_id, welcome_message, min_account_age_days, min_join_date_days, 
+                             restrict_new_users, delete_service_messages, enabled, max_warnings, 
+                             anti_flood_enabled, protect_comments, created_at)
+                            SELECT 
+                                chat_id, 
+                                welcome_message, 
+                                min_account_age_days, 
+                                min_join_date_days,
+                                restrict_new_users, 
+                                delete_service_messages, 
+                                enabled, 
+                                max_warnings,
+                                anti_flood_enabled,
+                                TRUE as protect_comments,  -- значение по умолчанию
+                                COALESCE(created_at, CURRENT_TIMESTAMP) as created_at
+                            FROM chat_settings
+                        ''')
+                        logger.info("Данные скопированы в временную таблицу")
+                    except Exception as copy_error:
+                        logger.info(f"Не удалось скопировать данные: {copy_error}")
+                        # Продолжаем с пустой таблицей
+
+                    # Удаляем старую таблицу
+                    cursor.execute('DROP TABLE IF EXISTS chat_settings')
+
+                    # Переименовываем временную таблицу
+                    cursor.execute('ALTER TABLE chat_settings_temp RENAME TO chat_settings')
+
+                    conn.commit()
+                    logger.info("Таблица chat_settings пересоздана с правильной структурой")
+
+        except Exception as e:
+            logger.error(f"Error recreating table: {e}")
+                
 # Инициализация базы данных
 try:
     db = DatabaseManager(DATABASE_URL)
@@ -548,6 +702,9 @@ async def safe_edit_message(
             # Это не ошибка, просто сообщение не изменилось
             logger.debug(f"Message {message_id} in chat {chat_id} was not modified (same content)")
             return True
+        elif "Message to edit not found" in str(e):
+            logger.warning(f"Message {message_id} not found in chat {chat_id}")
+            return False
         else:
             logger.error(f"Error editing message {message_id} in chat {chat_id}: {e}")
             return False
@@ -1310,6 +1467,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await show_comments_settings(update, context, chat_id, message_id)
         return
     elif data == "toggle_comments":
+        logger.info(f"Обработка нажатия кнопки toggle_comments для чата {chat_id}")
         await toggle_comments_protection(update, context, chat_id, message_id)
         return
     elif data == "comments_stats":
@@ -2149,79 +2307,135 @@ async def show_flood_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
         
 async def toggle_comments_protection(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
     """Переключение защиты комментариев"""
-    settings_data = db.get_chat_settings(chat_id)
-    if not settings_data:
-        return
+    try:
+        logger.info(f"Начало toggle_comments_protection для чата {chat_id}")
         
-    settings_data['protect_comments'] = not settings_data.get('protect_comments', True)
-    db.save_chat_settings(settings_data)
-    
-    status = "включена" if settings_data['protect_comments'] else "выключена"
-    await update.callback_query.answer(f"✅ Защита комментариев {status}")
-    await show_comments_settings(update, context, chat_id, message_id)
-
+        settings_data = db.get_chat_settings(chat_id)
+        if not settings_data:
+            logger.error(f"Не удалось загрузить настройки для чата {chat_id}")
+            await update.callback_query.answer("❌ Ошибка загрузки настроек")
+            return
+            
+        # Получаем текущее значение защиты комментариев
+        current_value = settings_data.get('protect_comments', True)
+        logger.info(f"Текущее значение protect_comments: {current_value}")
+        
+        # Инвертируем значение
+        new_value = not current_value
+        settings_data['protect_comments'] = new_value
+        
+        logger.info(f"Новое значение protect_comments: {new_value}")
+        
+        # Сохраняем настройки
+        db.save_chat_settings(settings_data)
+        logger.info("Настройки сохранены в БД")
+        
+        settings_data_after_save = db.get_chat_settings(chat_id)
+        if settings_data_after_save:
+            logger.info(f"Проверка после сохранения - protect_comments: {settings_data_after_save.get('protect_comments')}")
+            
+        # Формируем текст ответа
+        status = "включена" if new_value else "выключена"
+        await update.callback_query.answer(f"✅ Защита комментариев {status}")
+        logger.info(f"Отправлен ответ: Защита комментариев {status}")
+        
+        # Обновляем сообщение с настройками
+        await show_comments_settings(update, context, chat_id, message_id)
+        logger.info("Сообщение с настройками обновлено")
+        
+    except Exception as e:
+        logger.error(f"Error in toggle_comments_protection: {e}")
+        await update.callback_query.answer("❌ Ошибка при изменении настроек")
+        
 async def show_comments_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
     """Настройки защиты комментариев"""
-    settings_data = db.get_chat_settings(chat_id)
-    if not settings_data:
-        return
-    
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                f"{'🔴 Выкл' if settings_data.get('protect_comments', True) else '🟢 Вкл'} защиту комментариев", 
-                callback_data="toggle_comments"
-            )
-        ],
-        [
-            InlineKeyboardButton("📊 Статистика комментариев", callback_data="comments_stats"),
-            InlineKeyboardButton("⚙️ Настройки флуд-контроля", callback_data="flood_settings")
-        ],
-        [
-            InlineKeyboardButton("◀️ Назад", callback_data="main_settings"),
-            InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
+    try:
+        logger.info(f"Начало show_comments_settings для чата {chat_id}")
+        
+        settings_data = db.get_chat_settings(chat_id)
+        if not settings_data:
+            logger.error(f"Не удалось загрузить настройки для чата {chat_id}")
+            return
+        
+        # Получаем текущее состояние защиты комментариев
+        protect_comments = settings_data.get('protect_comments', True)
+        logger.info(f"Текущее состояние защиты комментариев: {protect_comments}")
+        
+        # Формируем текст кнопки в зависимости от состояния
+        button_text = f"{'🔴 Выключить' if protect_comments else '🟢 Включить'} защиту комментариев"
+        logger.info(f"Текст кнопки: {button_text}")
+        
+        keyboard = [
+            [InlineKeyboardButton(button_text, callback_data="toggle_comments")],
+            [
+                InlineKeyboardButton("📊 Статистика комментариев", callback_data="comments_stats"),
+                InlineKeyboardButton("⚙️ Настройки флуд-контроля", callback_data="flood_settings")
+            ],
+            [
+                InlineKeyboardButton("◀️ Назад", callback_data="main_settings"),
+                InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
+            ]
         ]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    stats = db.get_statistics(chat_id, 7)
-    comments_stats = stats.get('actions', {}).get('comment_posted', 0)
-    comments_deleted = stats.get('actions', {}).get('comment_deleted', 0)
-    
-    text = (
-        f"💬 <b>Защита комментариев</b>\n\n"
-        f"<b>Текущий статус:</b> {'🟢 ВКЛЮЧЕНА' if settings_data.get('protect_comments', True) else '🔴 ВЫКЛЮЧЕНА'}\n\n"
         
-        f"<b>📊 Статистика за 7 дней:</b>\n"
-        f"• Обработано комментариев: <b>{comments_stats}</b>\n"
-        f"• Удалено комментариев: <b>{comments_deleted}</b>\n"
-        f"• Эффективность: <b>{(comments_deleted/comments_stats*100) if comments_stats > 0 else 0:.1f}%</b>\n\n"
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        f"<b>🛡️ Активные защиты:</b>\n"
-        f"• Проверка возраста аккаунта\n"
-        f"• Флуд-контроль\n"
-        f"• Фильтр спам-ссылок\n"
-        f"• Система предупреждений\n\n"
+        stats = db.get_statistics(chat_id, 7)
+        comments_stats = stats.get('actions', {}).get('comment_posted', 0)
+        comments_deleted = stats.get('actions', {}).get('comment_deleted', 0)
         
-        f"💡 <i>Защита применяет те же правила, что и для основного чата</i>"
-    )
-    
-    if message_id:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML
+        # Добавляем временную метку для уникальности сообщения
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Безопасный расчет эффективности
+        if comments_stats > 0:
+            efficiency = (comments_deleted / comments_stats) * 100
+        else:
+            efficiency = 0
+        
+        text = (
+            f"💬 <b>Защита комментариев</b>\n\n"
+            f"<b>Текущий статус:</b> {'🟢 ВКЛЮЧЕНА' if protect_comments else '🔴 ВЫКЛЮЧЕНА'}\n\n"
+            
+            f"<b>📊 Статистика за 7 дней:</b>\n"
+            f"• Обработано комментариев: <b>{comments_stats}</b>\n"
+            f"• Удалено комментариев: <b>{comments_deleted}</b>\n"
+            f"• Эффективность: <b>{efficiency:.1f}%</b>\n\n"
+            
+            f"<b>🛡️ Активные защиты:</b>\n"
+            f"• Проверка возраста аккаунта\n"
+            f"• Флуд-контроль\n"
+            f"• Фильтр спам-ссылок\n"
+            f"• Система предупреждений\n\n"
+            
+            f"💡 <i>Защита применяет те же правила, что и для основного чата</i>\n"
+            f"<i>Обновлено: {timestamp}</i>"  # Добавляем временную метку
         )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML
-        )
+        
+        if message_id:
+            logger.info(f"Редактируем сообщение {message_id} в чате {chat_id}")
+            success = await safe_edit_message(context, chat_id, message_id, text, reply_markup)
+            if not success:
+                logger.warning(f"Не удалось отредактировать сообщение {message_id}")
+                # Если не удалось отредактировать, отправляем новое сообщение
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text + "\n\n⚠️ <i>Не удалось обновить сообщение</i>",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            logger.info(f"Отправляем новое сообщение в чат {chat_id}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+            
+        logger.info("show_comments_settings завершена успешно")
+        
+    except Exception as e:
+        logger.error(f"Error in show_comments_settings: {e}")
 
 async def show_comments_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
     """Статистика комментариев"""
@@ -2352,7 +2566,6 @@ def main() -> None:
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("info", info_command))
         application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_members))
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND, 
