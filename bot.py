@@ -106,7 +106,21 @@ class DatabaseManager:
                         )
                     ''')
                     
+                    # Таблица для ограничения частоты сообщений
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS message_cooldown (
+                            id SERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            user_id BIGINT NOT NULL,
+                            last_message TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE(chat_id, user_id)
+                        )
+                    ''')
+                    
                     # Индексы для оптимизации
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_cooldown_chat_user ON message_cooldown(chat_id, user_id)')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_cooldown_timestamp ON message_cooldown(last_message)')
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_statistics_chat_id ON statistics(chat_id)')
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_statistics_timestamp ON statistics(timestamp)')
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_statistics_action ON statistics(action_type)')
@@ -124,7 +138,7 @@ class DatabaseManager:
         """Получение настроек чата"""
         try:
             logger.info(f"Загрузка настроек для чата {chat_id}")
-            
+
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
@@ -132,13 +146,10 @@ class DatabaseManager:
                         (chat_id,)
                     )
                     result = cursor.fetchone()
-                    
+
                     if result:
-                        logger.info(f"Найдены настройки в БД: {result}")
-                        logger.info(f"Количество столбцов: {len(result)}")
-                        
                         # Анализируем структуру данных
-                        if len(result) == 11:  # Новая структура с protect_comments на позиции 9
+                        if len(result) == 12:
                             settings = {
                                 'chat_id': result[0],
                                 'welcome_message': str(result[1]),
@@ -149,10 +160,25 @@ class DatabaseManager:
                                 'enabled': bool(result[6]),
                                 'max_warnings': int(result[7]),
                                 'anti_flood_enabled': bool(result[8]),
-                                'protect_comments': bool(result[9]),  # protect_comments на позиции 9!
-                                'created_at': result[10]  # created_at на позиции 10
+                                'protect_comments': bool(result[9]),
+                                'message_cooldown_enabled': bool(result[10]),
+                                'created_at': result[11]
                             }
-                            logger.info(f"Используем protect_comments с индекса 9: {result[9]}")
+                        elif len(result) >= 11:
+                            settings = {
+                                'chat_id': result[0],
+                                'welcome_message': str(result[1]),
+                                'min_account_age_days': int(result[2]),
+                                'min_join_date_days': int(result[3]),
+                                'restrict_new_users': bool(result[4]),
+                                'delete_service_messages': bool(result[5]),
+                                'enabled': bool(result[6]),
+                                'max_warnings': int(result[7]),
+                                'anti_flood_enabled': bool(result[8]),
+                                'protect_comments': bool(result[9]),
+                                'message_cooldown_enabled': False,
+                                'created_at': result[10] if len(result) > 10 else None
+                            }
                         elif len(result) >= 10:  # Старая структура
                             settings = {
                                 'chat_id': result[0],
@@ -164,7 +190,8 @@ class DatabaseManager:
                                 'enabled': bool(result[6]),
                                 'max_warnings': int(result[7]),
                                 'anti_flood_enabled': bool(result[8]),
-                                'protect_comments': bool(result[9]) if len(result) > 9 else True
+                                'protect_comments': bool(result[9]) if len(result) > 9 else True,
+                                'message_cooldown_enabled': False  # Значение по умолчанию
                             }
                         else:
                             # Если столбцов меньше (старая структура), используем значения по умолчанию
@@ -178,10 +205,11 @@ class DatabaseManager:
                                 'enabled': bool(result[6]) if len(result) > 6 else True,
                                 'max_warnings': int(result[7]) if len(result) > 7 else 3,
                                 'anti_flood_enabled': bool(result[8]) if len(result) > 8 else True,
-                                'protect_comments': True  # Значение по умолчанию для нового поля
+                                'protect_comments': True,  # Значение по умолчанию
+                                'message_cooldown_enabled': False  # Значение по умолчанию
                             }
-                        
-                        logger.info(f"Загруженные настройки protect_comments: {settings.get('protect_comments')}")
+
+                        logger.info(f"Загруженные настройки message_cooldown_enabled: {settings.get('message_cooldown_enabled')}")
                         return settings
                     else:
                         logger.info("Настройки не найдены, создаем по умолчанию")
@@ -196,7 +224,8 @@ class DatabaseManager:
                             'enabled': True,
                             'max_warnings': 3,
                             'anti_flood_enabled': True,
-                            'protect_comments': True
+                            'protect_comments': True,
+                            'message_cooldown_enabled': False  # По умолчанию выключено
                         }
                         self.save_chat_settings(default_settings)
                         return default_settings
@@ -207,10 +236,7 @@ class DatabaseManager:
     def save_chat_settings(self, settings: Dict[str, Any]) -> None:
         """Сохранение настроек чата"""
         try:
-            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, protect_comments: {settings.get('protect_comments')}")
-
-            # Сначала убедимся, что столбец существует
-            self.update_database_schema()
+            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, message_cooldown_enabled: {settings.get('message_cooldown_enabled')}")
 
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
@@ -218,8 +244,8 @@ class DatabaseManager:
                         INSERT INTO chat_settings 
                         (chat_id, welcome_message, min_account_age_days, min_join_date_days, 
                          restrict_new_users, delete_service_messages, enabled, max_warnings, 
-                         anti_flood_enabled, protect_comments)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         anti_flood_enabled, protect_comments, message_cooldown_enabled)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (chat_id) DO UPDATE SET
                         welcome_message = EXCLUDED.welcome_message,
                         min_account_age_days = EXCLUDED.min_account_age_days,
@@ -229,7 +255,8 @@ class DatabaseManager:
                         enabled = EXCLUDED.enabled,
                         max_warnings = EXCLUDED.max_warnings,
                         anti_flood_enabled = EXCLUDED.anti_flood_enabled,
-                        protect_comments = EXCLUDED.protect_comments
+                        protect_comments = EXCLUDED.protect_comments,
+                        message_cooldown_enabled = EXCLUDED.message_cooldown_enabled
                     ''', (
                         settings['chat_id'],
                         settings['welcome_message'],
@@ -240,20 +267,14 @@ class DatabaseManager:
                         settings['enabled'],
                         settings['max_warnings'],
                         settings['anti_flood_enabled'],
-                        settings.get('protect_comments', True)
+                        settings.get('protect_comments', True),
+                        settings.get('message_cooldown_enabled', False)  # Новое поле
                     ))
                     conn.commit()
                     logger.info("Настройки успешно сохранены в БД")
         except Exception as e:
             logger.error(f"Error saving chat settings: {e}")
-            # Если ошибка связана с отсутствием столбца, обновляем схему и пробуем снова
-            if "protect_comments" in str(e) and "не существует" in str(e):
-                logger.info("Столбец protect_comments не существует, обновляем схему...")
-                self.update_database_schema()
-                # Пробуем сохранить снова
-                self.save_chat_settings(settings)
-            else:
-                raise
+            raise
 
 
     def log_action(self, chat_id: int, user_id: Optional[int], action_type: str, details: str = "") -> None:
@@ -542,16 +563,22 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Проверяем существование столбца protect_comments
-                    cursor.execute('''
-                        SELECT column_name 
-                        FROM information_schema.columns 
-                        WHERE table_name = 'chat_settings' AND column_name = 'protect_comments'
-                    ''')
-                    if not cursor.fetchone():
-                        # Добавляем отсутствующий столбец
-                        cursor.execute('ALTER TABLE chat_settings ADD COLUMN protect_comments BOOLEAN DEFAULT TRUE')
-                        logger.info("Added protect_comments column to chat_settings table")
+                    # Список столбцов для проверки и добавления
+                    columns_to_check = [
+                        ('protect_comments', 'BOOLEAN DEFAULT TRUE'),
+                        ('message_cooldown_enabled', 'BOOLEAN DEFAULT FALSE')
+                    ]
+
+                    for column_name, column_type in columns_to_check:
+                        cursor.execute('''
+                            SELECT column_name 
+                            FROM information_schema.columns 
+                            WHERE table_name = 'chat_settings' AND column_name = %s
+                        ''', (column_name,))
+                        if not cursor.fetchone():
+                            # Добавляем отсутствующий столбец
+                            cursor.execute(f'ALTER TABLE chat_settings ADD COLUMN {column_name} {column_type}')
+                            logger.info(f"Added {column_name} column to chat_settings table")
 
                     conn.commit()
         except Exception as e:
@@ -580,7 +607,7 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Создаем временную таблицу с правильной структурой
+                    # Создаем временную таблицу с правильной структурой ВКЛЮЧАЯ новый столбец
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS chat_settings_temp (
                             chat_id BIGINT PRIMARY KEY,
@@ -593,6 +620,7 @@ class DatabaseManager:
                             max_warnings INTEGER DEFAULT 3,
                             anti_flood_enabled BOOLEAN DEFAULT TRUE,
                             protect_comments BOOLEAN DEFAULT TRUE,
+                            message_cooldown_enabled BOOLEAN DEFAULT FALSE,  -- ДОБАВЛЯЕМ НОВЫЙ СТОЛБЕЦ
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     ''')
@@ -603,7 +631,7 @@ class DatabaseManager:
                             INSERT INTO chat_settings_temp 
                             (chat_id, welcome_message, min_account_age_days, min_join_date_days, 
                              restrict_new_users, delete_service_messages, enabled, max_warnings, 
-                             anti_flood_enabled, protect_comments, created_at)
+                             anti_flood_enabled, protect_comments, message_cooldown_enabled, created_at)
                             SELECT 
                                 chat_id, 
                                 welcome_message, 
@@ -614,7 +642,8 @@ class DatabaseManager:
                                 enabled, 
                                 max_warnings,
                                 anti_flood_enabled,
-                                TRUE as protect_comments,  -- значение по умолчанию
+                                COALESCE(protect_comments, TRUE) as protect_comments,
+                                COALESCE(message_cooldown_enabled, FALSE) as message_cooldown_enabled,  -- Новый столбец
                                 COALESCE(created_at, CURRENT_TIMESTAMP) as created_at
                             FROM chat_settings
                         ''')
@@ -634,6 +663,64 @@ class DatabaseManager:
 
         except Exception as e:
             logger.error(f"Error recreating table: {e}")
+    
+    def check_message_cooldown(self, chat_id: int, user_id: int, cooldown_seconds: int = 30) -> Tuple[bool, int]:
+        """
+        Проверка кд на отправку сообщений
+        Возвращает (can_send, seconds_remaining)
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Удаляем старые записи (старше 1 дня)
+                    cursor.execute(
+                        'DELETE FROM message_cooldown WHERE last_message < CURRENT_TIMESTAMP - INTERVAL \'1 day\''
+                    )
+                    
+                    # Проверяем последнее сообщение пользователя
+                    cursor.execute('''
+                        SELECT last_message FROM message_cooldown 
+                        WHERE chat_id = %s AND user_id = %s
+                    ''', (chat_id, user_id))
+                    
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        last_message_time = result[0]
+                        time_diff = datetime.now().replace(tzinfo=None) - last_message_time.replace(tzinfo=None)
+                        seconds_passed = time_diff.total_seconds()
+                        
+                        if seconds_passed < cooldown_seconds:
+                            seconds_remaining = int(cooldown_seconds - seconds_passed)
+                            return False, seconds_remaining
+                    
+                    # Обновляем время последнего сообщения
+                    cursor.execute('''
+                        INSERT INTO message_cooldown (chat_id, user_id, last_message)
+                        VALUES (%s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                        last_message = CURRENT_TIMESTAMP
+                    ''', (chat_id, user_id))
+                    
+                    conn.commit()
+                    return True, 0
+                    
+        except Exception as e:
+            logger.error(f"Error checking message cooldown: {e}")
+            return True, 0
+
+    def reset_user_cooldown(self, chat_id: int, user_id: int) -> None:
+        """Сброс кд для пользователя"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'DELETE FROM message_cooldown WHERE chat_id = %s AND user_id = %s',
+                        (chat_id, user_id)
+                    )
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Error resetting user cooldown: {e}")
                 
 # Инициализация базы данных
 try:
@@ -780,13 +867,14 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: Opti
             InlineKeyboardButton("👋 Приветствия", callback_data="welcome_settings")
         ],
         [
-            InlineKeyboardButton("💬 Комментарии", callback_data="comments_settings"),  # Новая кнопка
-            InlineKeyboardButton("📊 Статистика", callback_data="stats")
+            InlineKeyboardButton("💬 Комментарии", callback_data="comments_settings"),
+            InlineKeyboardButton("⏰ Ограничения", callback_data="cooldown_settings")  # Новая кнопка
         ],
         [
-            InlineKeyboardButton("❓ Помощь", callback_data="help_menu"),
-            InlineKeyboardButton("🔧 Быстрые действия", callback_data="quick_actions")
-        ]
+            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+            InlineKeyboardButton("❓ Помощь", callback_data="help_menu")
+        ],
+        [InlineKeyboardButton("🔧 Быстрые действия", callback_data="quick_actions")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1487,6 +1575,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.error(f"Error resetting flood stats: {e}")
             await query.answer("❌ Ошибка при сбросе статистики")
+    elif data == "cooldown_settings":
+        await show_cooldown_settings(update, context, chat_id, message_id)
+        return
+    elif data == "toggle_cooldown":
+        settings_data = db.get_chat_settings(chat_id)
+        if settings_data:
+            current_value = settings_data.get('message_cooldown_enabled', False)
+            settings_data['message_cooldown_enabled'] = not current_value
+            db.save_chat_settings(settings_data)
+            status = "включено" if settings_data['message_cooldown_enabled'] else "выключено"
+            await query.answer(f"✅ Ограничение сообщений {status}")
+            await show_cooldown_settings(update, context, chat_id, message_id)
+        return
+    elif data == "reset_all_cooldowns":
+        try:
+            with db.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('DELETE FROM message_cooldown WHERE chat_id = %s', (chat_id,))
+                    conn.commit()
+            await query.answer("✅ Все ограничения сброшены")
+            await show_cooldown_settings(update, context, chat_id, message_id)
+        except Exception as e:
+            logger.error(f"Error resetting cooldowns: {e}")
+            await query.answer("❌ Ошибка при сбросе ограничений")
+        return
     elif data == "reset_all_warnings":
         # Сброс всех предупреждений в чате
         # Здесь должна быть логика сброса всех предупреждений
@@ -2091,6 +2204,29 @@ async def handle_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = message.chat_id
         user_id = message.from_user.id
 
+        settings = db.get_chat_settings(chat_id)
+        if not settings or not settings['enabled']:
+            return
+
+        # Проверка ограничения частоты сообщений (для всех сообщений)
+        if settings.get('message_cooldown_enabled', False):
+            can_send, seconds_remaining = db.check_message_cooldown(chat_id, user_id, 30)
+            if not can_send:
+                try:
+                    await message.delete()
+                    warning_msg = await message.reply_text(
+                        f"⏰ Слишком часто! Отправляйте сообщения не чаще 1 раза в 30 секунд.\n"
+                        f"Попробуйте через {seconds_remaining} сек.",
+                        reply_to_message_id=message.message_id
+                    )
+                    # Удаляем предупреждение через 5 секунд
+                    await asyncio.sleep(5)
+                    await warning_msg.delete()
+                    return
+                except Exception as e:
+                    logger.error(f"Error handling message cooldown: {e}")
+                    return
+        
         # Проверяем, является ли сообщение комментарием
         is_comment = False
         
@@ -2541,6 +2677,91 @@ async def show_comments_stats(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=reply_markup,
             parse_mode=ParseMode.HTML
         )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+
+async def show_cooldown_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
+    """Настройки ограничения частоты сообщений"""
+    settings_data = db.get_chat_settings(chat_id)
+    if not settings_data:
+        return
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{'🔴 Выкл' if settings_data.get('message_cooldown_enabled', False) else '🟢 Вкл'} ограничение сообщений", 
+                callback_data="toggle_cooldown"
+            )
+        ],
+        [InlineKeyboardButton("🔄 Сбросить все ограничения", callback_data="reset_all_cooldowns")],
+        [
+            InlineKeyboardButton("◀️ Назад", callback_data="main_settings"),
+            InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Получаем статистику ограничений
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                    SELECT COUNT(*) FROM message_cooldown 
+                    WHERE chat_id = %s AND last_message >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                ''', (chat_id,))
+                recent_blocks = cursor.fetchone()[0] or 0
+                
+                cursor.execute('''
+                    SELECT COUNT(DISTINCT user_id) FROM message_cooldown 
+                    WHERE chat_id = %s AND last_message >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                ''', (chat_id,))
+                affected_users = cursor.fetchone()[0] or 0
+    except Exception as e:
+        logger.error(f"Error getting cooldown stats: {e}")
+        recent_blocks = 0
+        affected_users = 0
+    
+    # Добавляем временную метку для уникальности сообщения
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    text = (
+        f"⏰ <b>Ограничение частоты сообщений</b>\n\n"
+        
+        f"<b>Текущий статус:</b> {'🟢 ВКЛЮЧЕНО' if settings_data.get('message_cooldown_enabled', False) else '🔴 ВЫКЛЮЧЕНО'}\n\n"
+        
+        f"<b>⚙️ Параметры:</b>\n"
+        f"• Ограничение: <b>1 сообщение в 30 секунд</b>\n"
+        f"• При нарушении: <b>Удаление сообщения + предупреждение</b>\n\n"
+        
+        f"<b>📊 Статистика за 24 часа:</b>\n"
+        f"• Заблокировано сообщений: <b>{recent_blocks}</b>\n"
+        f"• Затронуто пользователей: <b>{affected_users}</b>\n\n"
+        
+        f"<b>💡 Для кого полезно:</b>\n"
+        f"• Против спамеров и ботов\n"
+        f"• Для уменьшения флуда\n"
+        f"• В важных деловых чатах\n\n"
+        
+        f"💡 <i>Ограничение применяется ко всем сообщениям и комментариям</i>\n"
+        f"<i>Обновлено: {timestamp}</i>"  # Добавляем временную метку
+    )
+    
+    if message_id:
+        success = await safe_edit_message(context, chat_id, message_id, text, reply_markup)
+        if not success:
+            # Если не удалось отредактировать, отправляем новое сообщение
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text + "\n\n⚠️ <i>Не удалось обновить сообщение</i>",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
     else:
         await context.bot.send_message(
             chat_id=chat_id,
