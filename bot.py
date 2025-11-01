@@ -4,11 +4,12 @@ import os
 import psycopg2
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, cast, Tuple, List
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message, Chat, User
+from telegram import ChatPermissions, Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message, Chat, User
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
-
+import telegram
+print(f"=== TELEGRAM LIBRARY VERSION: {telegram.__version__} ===")
 # Загрузка переменных окружения
 load_dotenv()
 
@@ -118,6 +119,21 @@ class DatabaseManager:
                         )
                     ''')
                     
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS user_captcha (
+                            id SERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            user_id BIGINT NOT NULL,
+                            captcha_passed BOOLEAN DEFAULT FALSE,
+                            captcha_message_id BIGINT,
+                            attempts INTEGER DEFAULT 0,
+                            max_attempts INTEGER DEFAULT 3,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            expires_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP + INTERVAL '10 minutes',
+                            UNIQUE(chat_id, user_id)
+                        )
+                    ''')
+                    
                     # Индексы для оптимизации
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_cooldown_chat_user ON message_cooldown(chat_id, user_id)')
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_cooldown_timestamp ON message_cooldown(last_message)')
@@ -127,7 +143,9 @@ class DatabaseManager:
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_warnings_chat_user ON user_warnings(chat_id, user_id)')
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_flood_control_chat_user ON flood_control(chat_id, user_id)')
                     cursor.execute('CREATE INDEX IF NOT EXISTS idx_flood_control_timestamp ON flood_control(last_message)')
-                    
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_captcha_chat_user ON user_captcha(chat_id, user_id)')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_captcha_expires ON user_captcha(expires_at)')
+                
                     conn.commit()
                     logger.info("Database initialized successfully")
         except Exception as e:
@@ -148,73 +166,31 @@ class DatabaseManager:
                     result = cursor.fetchone()
 
                     if result:
-                        # Анализируем структуру данных
-                        if len(result) == 12:
-                            settings = {
-                                'chat_id': result[0],
-                                'welcome_message': str(result[1]),
-                                'min_account_age_days': int(result[2]),
-                                'min_join_date_days': int(result[3]),
-                                'restrict_new_users': bool(result[4]),
-                                'delete_service_messages': bool(result[5]),
-                                'enabled': bool(result[6]),
-                                'max_warnings': int(result[7]),
-                                'anti_flood_enabled': bool(result[8]),
-                                'protect_comments': bool(result[9]),
-                                'message_cooldown_enabled': bool(result[10]),
-                                'created_at': result[11]
-                            }
-                        elif len(result) >= 11:
-                            settings = {
-                                'chat_id': result[0],
-                                'welcome_message': str(result[1]),
-                                'min_account_age_days': int(result[2]),
-                                'min_join_date_days': int(result[3]),
-                                'restrict_new_users': bool(result[4]),
-                                'delete_service_messages': bool(result[5]),
-                                'enabled': bool(result[6]),
-                                'max_warnings': int(result[7]),
-                                'anti_flood_enabled': bool(result[8]),
-                                'protect_comments': bool(result[9]),
-                                'message_cooldown_enabled': False,
-                                'created_at': result[10] if len(result) > 10 else None
-                            }
-                        elif len(result) >= 10:  # Старая структура
-                            settings = {
-                                'chat_id': result[0],
-                                'welcome_message': str(result[1]),
-                                'min_account_age_days': int(result[2]),
-                                'min_join_date_days': int(result[3]),
-                                'restrict_new_users': bool(result[4]),
-                                'delete_service_messages': bool(result[5]),
-                                'enabled': bool(result[6]),
-                                'max_warnings': int(result[7]),
-                                'anti_flood_enabled': bool(result[8]),
-                                'protect_comments': bool(result[9]) if len(result) > 9 else True,
-                                'message_cooldown_enabled': False  # Значение по умолчанию
-                            }
-                        else:
-                            # Если столбцов меньше (старая структура), используем значения по умолчанию
-                            settings = {
-                                'chat_id': result[0],
-                                'welcome_message': str(result[1]) if len(result) > 1 else '👋 Добро пожаловать, {mention}! Рады видеть вас в {chat}!',
-                                'min_account_age_days': int(result[2]) if len(result) > 2 else 1,
-                                'min_join_date_days': int(result[3]) if len(result) > 3 else 0,
-                                'restrict_new_users': bool(result[4]) if len(result) > 4 else True,
-                                'delete_service_messages': bool(result[5]) if len(result) > 5 else True,
-                                'enabled': bool(result[6]) if len(result) > 6 else True,
-                                'max_warnings': int(result[7]) if len(result) > 7 else 3,
-                                'anti_flood_enabled': bool(result[8]) if len(result) > 8 else True,
-                                'protect_comments': True,  # Значение по умолчанию
-                                'message_cooldown_enabled': False  # Значение по умолчанию
-                            }
+                        # Универсальная обработка с проверкой наличия столбцов
+                        columns = [desc[0] for desc in cursor.description]
+                        settings = {
+                            'chat_id': result[columns.index('chat_id')],
+                            'welcome_message': str(result[columns.index('welcome_message')]),
+                            'min_account_age_days': int(result[columns.index('min_account_age_days')]),
+                            'min_join_date_days': int(result[columns.index('min_join_date_days')]),
+                            'restrict_new_users': bool(result[columns.index('restrict_new_users')]),
+                            'delete_service_messages': bool(result[columns.index('delete_service_messages')]),
+                            'enabled': bool(result[columns.index('enabled')]),
+                            'max_warnings': int(result[columns.index('max_warnings')]),
+                            'anti_flood_enabled': bool(result[columns.index('anti_flood_enabled')]),
+                            'protect_comments': bool(result[columns.index('protect_comments')]) if 'protect_comments' in columns else True,
+                            'message_cooldown_enabled': bool(result[columns.index('message_cooldown_enabled')]) if 'message_cooldown_enabled' in columns else False,
+                            'captcha_enabled': bool(result[columns.index('captcha_enabled')]) if 'captcha_enabled' in columns else False,
+                            'captcha_type': str(result[columns.index('captcha_type')]) if 'captcha_type' in columns else 'button',
+                            'captcha_timeout_minutes': int(result[columns.index('captcha_timeout_minutes')]) if 'captcha_timeout_minutes' in columns else 10,
+                            'captcha_max_attempts': int(result[columns.index('captcha_max_attempts')]) if 'captcha_max_attempts' in columns else 3
+                        }
 
-                        logger.info(f"Загруженные настройки message_cooldown_enabled: {settings.get('message_cooldown_enabled')}")
+                        logger.info(f"Загруженные настройки captcha_enabled: {settings.get('captcha_enabled')}")
                         return settings
                     else:
-                        logger.info("Настройки не найдены, создаем по умолчанию")
                         # Создаем настройки по умолчанию
-                        default_settings: Dict[str, Any] = {
+                        default_settings = {
                             'chat_id': chat_id,
                             'welcome_message': '👋 Добро пожаловать, {mention}! Рады видеть вас в {chat}!',
                             'min_account_age_days': 1,
@@ -225,7 +201,11 @@ class DatabaseManager:
                             'max_warnings': 3,
                             'anti_flood_enabled': True,
                             'protect_comments': True,
-                            'message_cooldown_enabled': False  # По умолчанию выключено
+                            'message_cooldown_enabled': False,
+                            'captcha_enabled': False,
+                            'captcha_type': 'button',
+                            'captcha_timeout_minutes': 10,
+                            'captcha_max_attempts': 3
                         }
                         self.save_chat_settings(default_settings)
                         return default_settings
@@ -236,7 +216,7 @@ class DatabaseManager:
     def save_chat_settings(self, settings: Dict[str, Any]) -> None:
         """Сохранение настроек чата"""
         try:
-            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, message_cooldown_enabled: {settings.get('message_cooldown_enabled')}")
+            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, captcha_enabled: {settings.get('captcha_enabled')}")
 
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
@@ -244,8 +224,9 @@ class DatabaseManager:
                         INSERT INTO chat_settings 
                         (chat_id, welcome_message, min_account_age_days, min_join_date_days, 
                          restrict_new_users, delete_service_messages, enabled, max_warnings, 
-                         anti_flood_enabled, protect_comments, message_cooldown_enabled)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         anti_flood_enabled, protect_comments, message_cooldown_enabled,
+                         captcha_enabled, captcha_type, captcha_timeout_minutes, captcha_max_attempts)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (chat_id) DO UPDATE SET
                         welcome_message = EXCLUDED.welcome_message,
                         min_account_age_days = EXCLUDED.min_account_age_days,
@@ -256,7 +237,11 @@ class DatabaseManager:
                         max_warnings = EXCLUDED.max_warnings,
                         anti_flood_enabled = EXCLUDED.anti_flood_enabled,
                         protect_comments = EXCLUDED.protect_comments,
-                        message_cooldown_enabled = EXCLUDED.message_cooldown_enabled
+                        message_cooldown_enabled = EXCLUDED.message_cooldown_enabled,
+                        captcha_enabled = EXCLUDED.captcha_enabled,
+                        captcha_type = EXCLUDED.captcha_type,
+                        captcha_timeout_minutes = EXCLUDED.captcha_timeout_minutes,
+                        captcha_max_attempts = EXCLUDED.captcha_max_attempts
                     ''', (
                         settings['chat_id'],
                         settings['welcome_message'],
@@ -268,7 +253,11 @@ class DatabaseManager:
                         settings['max_warnings'],
                         settings['anti_flood_enabled'],
                         settings.get('protect_comments', True),
-                        settings.get('message_cooldown_enabled', False)  # Новое поле
+                        settings.get('message_cooldown_enabled', False),
+                        settings.get('captcha_enabled'),
+                        settings.get('captcha_type', 'button'),
+                        settings.get('captcha_timeout_minutes', 10),
+                        settings.get('captcha_max_attempts', 3)
                     ))
                     conn.commit()
                     logger.info("Настройки успешно сохранены в БД")
@@ -566,7 +555,11 @@ class DatabaseManager:
                     # Список столбцов для проверки и добавления
                     columns_to_check = [
                         ('protect_comments', 'BOOLEAN DEFAULT TRUE'),
-                        ('message_cooldown_enabled', 'BOOLEAN DEFAULT FALSE')
+                        ('message_cooldown_enabled', 'BOOLEAN DEFAULT FALSE'),
+                        ('captcha_enabled', 'BOOLEAN DEFAULT FALSE'),  # Новая настройка
+                        ('captcha_type', 'VARCHAR(20) DEFAULT \'button\''),  # Тип капчи
+                        ('captcha_timeout_minutes', 'INTEGER DEFAULT 10'),  # Таймаут капчи
+                        ('captcha_max_attempts', 'INTEGER DEFAULT 3')  # Макс попыток
                     ]
 
                     for column_name, column_type in columns_to_check:
@@ -721,7 +714,116 @@ class DatabaseManager:
                     conn.commit()
         except Exception as e:
             logger.error(f"Error resetting user cooldown: {e}")
-                
+    
+    def create_captcha(self, chat_id: int, user_id: int, message_id: int) -> bool:
+        """Создание капчи для пользователя"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO user_captcha (chat_id, user_id, captcha_message_id, expires_at)
+                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP + INTERVAL '10 minutes')
+                        ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                        captcha_passed = FALSE,
+                        captcha_message_id = EXCLUDED.captcha_message_id,
+                        attempts = 0,
+                        expires_at = EXCLUDED.expires_at
+                    ''', (chat_id, user_id, message_id))
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error creating captcha: {e}")
+            return False
+
+    def check_captcha_passed(self, chat_id: int, user_id: int) -> bool:
+        """Проверка, прошел ли пользователь капчу"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Удаляем просроченные капчи
+                    cursor.execute('DELETE FROM user_captcha WHERE expires_at < CURRENT_TIMESTAMP')
+
+                    cursor.execute('''
+                        SELECT captcha_passed FROM user_captcha 
+                        WHERE chat_id = %s AND user_id = %s
+                    ''', (chat_id, user_id))
+
+                    result = cursor.fetchone()
+                    return result[0] if result else False
+        except Exception as e:
+            logger.error(f"Error checking captcha: {e}")
+            return False
+
+    def mark_captcha_passed(self, chat_id: int, user_id: int) -> bool:
+        """Отметка капчи как пройденной"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE user_captcha 
+                        SET captcha_passed = TRUE 
+                        WHERE chat_id = %s AND user_id = %s
+                    ''', (chat_id, user_id))
+                    conn.commit()
+                    return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error marking captcha passed: {e}")
+            return False
+
+    def increment_captcha_attempts(self, chat_id: int, user_id: int) -> Tuple[bool, int]:
+        """Увеличение счетчика попыток и проверка лимита"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE user_captcha 
+                        SET attempts = attempts + 1 
+                        WHERE chat_id = %s AND user_id = %s
+                        RETURNING attempts, max_attempts
+                    ''', (chat_id, user_id))
+
+                    result = cursor.fetchone()
+                    conn.commit()
+
+                    if result:
+                        attempts, max_attempts = result
+                        return attempts >= max_attempts, attempts
+                    return False, 0
+        except Exception as e:
+            logger.error(f"Error incrementing captcha attempts: {e}")
+            return False, 0
+
+    def delete_captcha(self, chat_id: int, user_id: int) -> bool:
+        """Удаление капчи пользователя"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        DELETE FROM user_captcha 
+                        WHERE chat_id = %s AND user_id = %s
+                    ''', (chat_id, user_id))
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error deleting captcha: {e}")
+            return False
+
+    def get_captcha_message_id(self, chat_id: int, user_id: int) -> Optional[int]:
+        """Получение ID сообщения с капчей"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute('''
+                        SELECT captcha_message_id FROM user_captcha 
+                        WHERE chat_id = %s AND user_id = %s
+                    ''', (chat_id, user_id))
+
+                    result = cursor.fetchone()
+                    return result[0] if result else None
+        except Exception as e:
+            logger.error(f"Error getting captcha message ID: {e}")
+            return None
+
 # Инициализация базы данных
 try:
     db = DatabaseManager(DATABASE_URL)
@@ -1009,11 +1111,12 @@ async def show_main_settings(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                callback_data="toggle_flood")
         ],
         [
-            InlineKeyboardButton("⚠️ Предупреждения", callback_data="warnings_settings"),
-            InlineKeyboardButton("👤 Ограничения", callback_data="restrict_settings")
+            InlineKeyboardButton(f"{'✅' if settings_data.get('captcha_enabled', False) else '❌'} Капча", 
+                               callback_data="captcha_settings"),
+            InlineKeyboardButton("⚠️ Предупреждения", callback_data="warnings_settings")
         ],
-        
         [
+            InlineKeyboardButton("◀️ Назад", callback_data="main_menu"),
             InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
         ]
     ]
@@ -1030,11 +1133,11 @@ async def show_main_settings(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"• Мин. возраст аккаунта: <b>{settings_data['min_account_age_days']} дн.</b>\n"
         f"• Удаление сообщений: <b>{'ВКЛ' if settings_data['delete_service_messages'] else 'ВЫКЛ'}</b>\n"
         f"• Анти-флуд: <b>{'ВКЛ' if settings_data['anti_flood_enabled'] else 'ВЫКЛ'}</b>\n"
-        f"• Макс. предупреждений: <b>{settings_data['max_warnings']}</b>\n"
-        f"• Ограничения новых: <b>{'ВКЛ' if settings_data['restrict_new_users'] else 'ВЫКЛ'}</b>\n"
+        f"• Капча для новых: <b>{'ВКЛ' if settings_data.get('captcha_enabled', False) else 'ВЫКЛ'}</b>\n"
+        f"• Макс. предупреждений: <b>{settings_data['max_warnings']}</b>\n\n"
         
         f"💡 <i>Выберите параметр для изменения</i>\n"
-        f"<i>Обновлено: {timestamp}</i>"  # Добавляем временную метку
+        f"<i>Обновлено: {timestamp}</i>"
     )
     
     if message_id:
@@ -1600,6 +1703,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.error(f"Error resetting cooldowns: {e}")
             await query.answer("❌ Ошибка при сбросе ограничений")
         return
+    elif data == "captcha_settings":
+        await show_captcha_settings(update, context, chat_id, message_id)
+        return
+    elif data == "toggle_captcha":
+        settings_data = db.get_chat_settings(chat_id)
+        if settings_data:
+            current_value = settings_data.get('captcha_enabled', False)
+            logger.info(f"Текущее значение captcha_enabled: {current_value}")
+
+            settings_data['captcha_enabled'] = not current_value
+            logger.info(f"Новое значение captcha_enabled: {settings_data['captcha_enabled']}")
+
+            # Принудительно сохраняем все настройки
+            try:
+                db.save_chat_settings(settings_data)
+                logger.info("Настройки успешно сохранены")
+
+                # Проверяем сохранение
+                settings_after_save = db.get_chat_settings(chat_id)
+                if settings_after_save:
+                    logger.info(f"Проверка после сохранения - captcha_enabled: {settings_after_save.get('captcha_enabled')}")
+
+                status = "включена" if settings_data['captcha_enabled'] else "выключена"
+                await query.answer(f"✅ Капча {status}")
+
+                # Добавляем небольшую задержку перед обновлением
+                await asyncio.sleep(0.5)
+                await show_captcha_settings(update, context, chat_id, message_id)
+
+            except Exception as save_error:
+                logger.error(f"Error saving captcha settings: {save_error}")
+                await query.answer("❌ Ошибка при сохранении настроек", show_alert=True)
+        return
     elif data == "reset_all_warnings":
         # Сброс всех предупреждений в чате
         # Здесь должна быть логика сброса всех предупреждений
@@ -1775,7 +1911,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await show_welcome_settings(update, context, chat_id, message_id)
                 
 async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик новых участников"""
+    """Обработчик новых участников с улучшенной логикой капчи"""
     chat = update.effective_chat
     message = update.message
     
@@ -1783,12 +1919,10 @@ async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
         
     settings_data = db.get_chat_settings(chat.id)
-    
     if not settings_data or not settings_data['enabled']:
         return
     
     for member in message.new_chat_members:
-        # Проверка что member не None
         if not member:
             continue
             
@@ -1799,14 +1933,12 @@ async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Логируем нового участника
         db.log_action(chat.id, member.id, 'new_member', f'username: {member.username}')
             
-        # Проверка возраста аккаунта с явным приведением типа
+        # Проверка возраста аккаунта
         if settings_data['min_account_age_days'] > 0:
-            # Используем getattr для безопасного доступа к атрибуту date
             member_date = getattr(member, 'date', None)
             if member_date:
-                # Явное указание типа для account_age_delta
-                account_age_delta: timedelta = datetime.now().replace(tzinfo=None) - member_date.replace(tzinfo=None)
-                account_age_days: int = account_age_delta.days
+                account_age_delta = datetime.now().replace(tzinfo=None) - member_date.replace(tzinfo=None)
+                account_age_days = account_age_delta.days
                 
                 if account_age_days < settings_data['min_account_age_days']:
                     try:
@@ -1818,7 +1950,20 @@ async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     except Exception as e:
                         logger.error(f"Error kicking user: {e}")
         
+        # Улучшенная проверка капчи
+        captcha_enabled = settings_data.get('captcha_enabled', False)
+        logger.info(f"КАПЧА ДЛЯ ПОЛЬЗОВАТЕЛЯ {member.id}: {captcha_enabled}")
         
+        if captcha_enabled:
+            user_name = member.first_name or 'Пользователь'
+            # Проверяем, не прошел ли уже пользователь капчу
+            captcha_passed = db.check_captcha_passed(chat.id, member.id)
+            
+            if not captcha_passed:
+                await send_captcha(update, context, chat.id, member.id, user_name)
+                continue  # Пропускаем приветствие если есть капча
+        
+        # Стандартное приветствие (если капча отключена или уже пройдена)
         if settings_data['welcome_message']:
             welcome_text = settings_data['welcome_message']
             
@@ -1838,13 +1983,45 @@ async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.error(f"Error sending welcome message: {e}")
     
     # Удаление сервисного сообщения (всегда, независимо от тихого режима)
-    if settings_data['delete_service_messages']:
-        try:
-            await message.delete()
-            db.log_action(chat.id, None, 'service_message_deleted')
-        except Exception as e:
-            logger.error(f"Error deleting service message: {e}")
+    # if settings_data['delete_service_messages']:
+    #     try:
+    #         await message.delete()
+    #         db.log_action(chat.id, None, 'service_message_deleted')
+        # except Exception as e:
+        #     logger.error(f"Error deleting service message: {e}")
 
+async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для проверки структуры базы данных"""
+    chat = update.effective_chat
+    message = update.message
+    
+    if not chat or not message:
+        return
+        
+    try:
+        # Принудительное обновление схемы
+        db.update_database_schema()
+        
+        # Проверка структуры таблицы
+        db.check_table_structure()
+        
+        # Проверка настроек текущего чата
+        settings = db.get_chat_settings(chat.id)
+        
+        response = (
+            "✅ <b>Проверка базы данных завершена</b>\n\n"
+            f"🆔 ID чата: <code>{chat.id}</code>\n"
+            f"🛡️ Защита включена: <b>{settings['enabled']}</b>\n"
+            f"🤖 Капча включена: <b>{settings.get('captcha_enabled', False)}</b>\n"
+            f"💬 Защита комментариев: <b>{settings.get('protect_comments', True)}</b>\n\n"
+            "📊 <i>Подробности в логах бота</i>"
+        )
+        
+        await message.reply_text(response, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        logger.error(f"Error checking database: {e}")
+        await message.reply_text("❌ Ошибка при проверке базы данных")
 
 async def enable_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /enable"""
@@ -2208,6 +2385,26 @@ async def handle_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not settings or not settings['enabled']:
             return
 
+        # Проверка капчи (если включена)
+        if settings.get('captcha_enabled', False):
+            captcha_passed = db.check_captcha_passed(chat_id, user_id)
+            if not captcha_passed:
+                try:
+                    await message.delete()
+                    # Отправляем напоминание о капче
+                    reminder_msg = await message.reply_text(
+                        f"⏳ <b>Пройдите проверку безопасности!</b>\n\n"
+                        f"Чтобы писать сообщения, сначала подтвердите, что вы не бот.",
+                        reply_to_message_id=message.message_id
+                    )
+                    # Удаляем напоминание через 5 секунд
+                    await asyncio.sleep(5)
+                    await reminder_msg.delete()
+                    return
+                except Exception as e:
+                    logger.error(f"Error handling captcha check: {e}")
+                    return
+        
         # Проверка ограничения частоты сообщений (для всех сообщений)
         if settings.get('message_cooldown_enabled', False):
             can_send, seconds_remaining = db.check_message_cooldown(chat_id, user_id, 30)
@@ -2769,15 +2966,339 @@ async def show_cooldown_settings(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=reply_markup,
             parse_mode=ParseMode.HTML
         )
+
+async def send_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, user_name: str) -> None:
+    """Улучшенная отправка капчи новому пользователю"""
+    try:
+        settings = db.get_chat_settings(chat_id)
+        if not settings:
+            return
+
+        # Создаем клавиатуру с кнопкой капчи
+        keyboard = [
+            [InlineKeyboardButton("✅ Я не бот", callback_data=f"captcha_verify_{user_id}")],
+            [InlineKeyboardButton("🚫 Я бот", callback_data=f"captcha_bot_{user_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Отправляем сообщение с капчей
+        captcha_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"👋 <b>Добро пожаловать, {user_name}!</b>\n\n"
+                "🛡️ <b>Проверка безопасности</b>\n\n"
+                "Чтобы доказать, что вы не бот, нажмите кнопку '✅ Я не бот':\n\n"
+                "⏰ <i>У вас есть 10 минут для прохождения проверки</i>\n"
+                "❌ <i>При неудаче вы будете удалены из чата</i>"
+            ),
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+
+        # Сохраняем капчу в базу
+        success = db.create_captcha(chat_id, user_id, captcha_message.message_id)
+        
+        if success:
+            logger.info(f"Капча успешно отправлена пользователю {user_id} в чате {chat_id}")
+            
+            # Ограничиваем права пользователя - используем ТОЛЬКО старый формат
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False
+                    )
+                )
+                logger.info(f"Права пользователя {user_id} ограничены")
+            except Exception as e:
+                logger.error(f"Error restricting user: {e}")
+
+        else:
+            logger.error(f"Не удалось сохранить капчу для пользователя {user_id}")
+
+    except Exception as e:
+        logger.error(f"Error sending captcha: {e}")
+
+async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик только для кнопок верификации капчи"""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    data = query.data
+
+    logger.info(f"CAPTCHA VERIFICATION: user_id={user_id}, chat_id={chat_id}, data={data}")
+
+    try:
+        await query.answer()
+    except Exception as e:
+        if "Query is too old" in str(e) or "response timeout expired" in str(e):
+            logger.warning(f"Captcha callback query expired for user {user_id}")
+        else:
+            logger.error(f"Error answering captcha callback: {e}")
+            return
+
+    try:
+        parts = data.split('_')
+        if len(parts) < 3:
+            return
+            
+        target_user_id = int(parts[-1])
+        
+        if user_id != target_user_id:
+            try:
+                await query.answer("❌ Эта проверка не для вас!", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if data.startswith('captcha_verify_'):
+            logger.info(f"User {user_id} passed captcha in chat {chat_id}")
+            
+            success = db.mark_captcha_passed(chat_id, user_id)
+            
+            if success:
+                # ВОССТАНОВЛЕНИЕ ПРАВ - МИНИМАЛЬНЫЙ ФОРМАТ
+                try:
+                    # Используем только can_send_messages для старых версий
+                    await context.bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        permissions=ChatPermissions(
+                            can_send_messages=True
+                        )
+                    )
+                    logger.info(f"✅ Rights restored for user {user_id}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error unrestricting user {user_id}: {e}")
+                    # Попробуем альтернативный способ - снять все ограничения
+                    try:
+                        await context.bot.restrict_chat_member(
+                            chat_id=chat_id,
+                            user_id=user_id,
+                            permissions=ChatPermissions(
+                                can_send_messages=True,
+                                can_send_media_messages=True,
+                                can_send_other_messages=True,
+                                can_add_web_page_previews=True
+                            )
+                        )
+                        logger.info(f"✅ Rights restored (alternative method) for user {user_id}")
+                    except Exception as e2:
+                        logger.error(f"❌ Alternative unrestrict also failed: {e2}")
+
+                # Редактируем сообщение с капчей
+                try:
+                    await query.edit_message_text(
+                        "✅ <b>Проверка пройдена успешно!</b>\n\n"
+                        "Теперь вы можете общаться в чате.\n\n"
+                        f"👤 <i>Пользователь: {query.from_user.first_name}</i>",
+                        parse_mode=ParseMode.HTML
+                    )
+                    logger.info(f"✅ Captcha message updated for user {user_id}")
+                except Exception as e:
+                    logger.error(f"❌ Error editing captcha message: {e}")
+                
+                db.log_action(chat_id, user_id, 'captcha_passed')
+                logger.info(f"🎉 CAPTCHA COMPLETED SUCCESSFULLY for user {user_id}")
+
+            else:
+                logger.error(f"❌ Failed to mark captcha as passed for user {user_id}")
+                try:
+                    await query.answer("❌ Ошибка проверки. Попробуйте еще раз.", show_alert=True)
+                except Exception:
+                    pass
+
+        elif data.startswith('captcha_bot_'):
+            logger.info(f"User {user_id} failed captcha in chat {chat_id}")
+            
+            max_attempts_reached, attempts = db.increment_captcha_attempts(chat_id, user_id)
+            
+            if max_attempts_reached:
+                logger.info(f"🚫 Max attempts reached for user {user_id}, banning")
+                try:
+                    await context.bot.ban_chat_member(chat_id, user_id)
+                    await context.bot.unban_chat_member(chat_id, user_id)
+                    
+                    try:
+                        await query.edit_message_text(
+                            f"🚫 <b>Пользователь удален</b>\n\n"
+                            f"Причина: превышение попыток проверки\n"
+                            f"👤 <i>Пользователь: {query.from_user.first_name}</i>",
+                            parse_mode=ParseMode.HTML
+                        )
+                        logger.info(f"🚫 User {user_id} banned for failed captcha")
+                    except Exception as e:
+                        logger.error(f"❌ Error editing ban message: {e}")
+                    
+                    db.log_action(chat_id, user_id, 'user_banned', 'failed_captcha')
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error banning user: {e}")
+            else:
+                remaining_attempts = 3 - attempts
+                logger.info(f"⚠️ User {user_id} failed captcha, attempts: {attempts}, remaining: {remaining_attempts}")
+                try:
+                    await query.answer(
+                        f"⚠️ Неверный ответ! Попыток осталось: {remaining_attempts}",
+                        show_alert=True
+                    )
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error(f"❌ Error handling captcha callback: {e}")
+
+async def check_captcha_expired(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверка просроченных капч (запускается по расписанию)"""
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                # Находим просроченные капчи
+                cursor.execute('''
+                    SELECT chat_id, user_id, captcha_message_id 
+                    FROM user_captcha 
+                    WHERE expires_at < CURRENT_TIMESTAMP AND captcha_passed = FALSE
+                ''')
+                expired_captchas = cursor.fetchall()
+
+                for chat_id, user_id, message_id in expired_captchas:
+                    try:
+                        # Кикаем пользователя
+                        await context.bot.ban_chat_member(chat_id, user_id)
+                        await context.bot.unban_chat_member(chat_id, user_id)
+                        
+                        # Редактируем сообщение с капчей
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text="⏰ <b>Время проверки истекло</b>\n\nПользователь был удален из чата.",
+                            parse_mode=ParseMode.HTML
+                        )
+                        
+                        # Удаляем капчу из базы
+                        db.delete_captcha(chat_id, user_id)
+                        
+                        db.log_action(chat_id, user_id, 'user_banned', 'captcha_timeout')
+                        logger.info(f"User {user_id} kicked for captcha timeout in chat {chat_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error handling expired captcha for user {user_id}: {e}")
+                        # Все равно удаляем капчу из базы
+                        db.delete_captcha(chat_id, user_id)
+
+    except Exception as e:
+        logger.error(f"Error checking expired captchas: {e}")
+        
+async def show_captcha_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
+    """Настройки капчи"""
+    settings_data = db.get_chat_settings(chat_id)
+    if not settings_data:
+        return
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{'🔴 Выкл' if settings_data.get('captcha_enabled', False) else '🟢 Вкл'} капчу", 
+                callback_data="toggle_captcha"
+            )
+        ],
+        [
+            InlineKeyboardButton("⏰ Таймаут: 10 мин", callback_data="noop"),
+            InlineKeyboardButton("🔄 Попытки: 3", callback_data="noop")
+        ],
+        [
+            InlineKeyboardButton("◀️ Назад", callback_data="main_settings"),
+            InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Статистика капчи
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(CASE WHEN captcha_passed = TRUE THEN 1 END) as passed,
+                        COUNT(CASE WHEN captcha_passed = FALSE AND expires_at < CURRENT_TIMESTAMP THEN 1 END) as failed
+                    FROM user_captcha 
+                    WHERE chat_id = %s
+                ''', (chat_id,))
+                stats = cursor.fetchone()
+                total, passed, failed = stats if stats else (0, 0, 0)
+    except Exception as e:
+        logger.error(f"Error getting captcha stats: {e}")
+        total, passed, failed = 0, 0, 0
+    
+    # Добавляем временную метку для уникальности сообщения
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    text = (
+        f"🤖 <b>Настройки капчи</b>\n\n"
+        
+        f"<b>Текущий статус:</b> {'🟢 ВКЛЮЧЕНА' if settings_data.get('captcha_enabled', False) else '🔴 ВЫКЛЮЧЕНА'}\n\n"
+        
+        f"<b>📊 Статистика капчи:</b>\n"
+        f"• Всего проверок: <b>{total}</b>\n"
+        f"• Успешно пройдено: <b>{passed}</b>\n"
+        f"• Провалено/истекло: <b>{failed}</b>\n\n"
+        
+        f"<b>⚙️ Параметры капчи:</b>\n"
+        f"• Тип: <b>Кнопочная капча</b>\n"
+        f"• Таймаут: <b>10 минут</b>\n"
+        f"• Макс. попыток: <b>3</b>\n\n"
+        
+        f"<b>💡 Как работает:</b>\n"
+        f"• Новые пользователи получают проверку\n"
+        f"• Нужно нажать кнопку 'Я не бот'\n"
+        f"• При неудаче - удаление из чата\n"
+        f"• При успехе - полный доступ к чату\n\n"
+        
+        f"💡 <i>Эффективно против ботов и спамеров</i>\n"
+        f"<i>Обновлено: {timestamp}</i>"  # Добавляем временную метку
+    )
+    
+    if message_id:
+        success = await safe_edit_message(context, chat_id, message_id, text, reply_markup)
+        if not success:
+            # Если не удалось отредактировать, отправляем новое сообщение
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text + "\n\n⚠️ <i>Не удалось обновить сообщение</i>",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
         
 def main() -> None:
     """Основная функция запуска бота"""
     try:
-        # Приведение типа для токена
         token = cast(str, BOT_TOKEN)
         application = Application.builder().token(token).build()
         
-        # Добавление обработчиков
+        # ВАЖНО: сначала обработчик капчи с паттерном, потом общий обработчик
+        application.add_handler(CallbackQueryHandler(
+            handle_captcha_callback, 
+            pattern="^captcha_(verify|bot)_"
+        ))
+        
+        # Затем общий обработчик кнопок
+        application.add_handler(CallbackQueryHandler(button_handler))
+        
+        # Остальные обработчики...
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("menu", menu))
         application.add_handler(CommandHandler("settings", menu))  
@@ -2786,17 +3307,26 @@ def main() -> None:
         application.add_handler(CommandHandler("disable", disable_bot))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("info", info_command))
-        application.add_handler(CallbackQueryHandler(button_handler))
+        application.add_handler(CommandHandler("checkdb", check_db))
+        # application.add_handler(CommandHandler("debug_captcha", debug_captcha))
+        
+        # Обработчики сообщений
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_members))
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND, 
             handle_comments
         ))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        # Обработчик ошибок
+        
+        # Планировщик
+        job_queue = application.job_queue
+        if job_queue:
+            job_queue.run_repeating(check_captcha_expired, interval=60, first=10)
+        
         application.add_error_handler(error_handler)
         
         logger.info("Бот запускается...")
+        logger.info("Обработчики зарегистрированы: сначала капча, потом общие кнопки")
         application.run_polling()
         
     except Exception as e:
