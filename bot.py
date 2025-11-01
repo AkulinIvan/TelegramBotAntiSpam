@@ -32,6 +32,11 @@ if not DATABASE_URL:
     logger.error("DATABASE_URL not found in environment variables")
     exit(1)
 
+class CaptchaPolicy:
+    PERSISTENT = "persistent"      # ✅ Рекомендуется
+    TIME_BASED = "time_based"      # 🔄 Для строгих чатов
+    ALWAYS = "always"              # 🚫 Макс. безопасность
+
 class DatabaseManager:
     def __init__(self, connection_string: str):
         self.conn_string = connection_string
@@ -66,6 +71,13 @@ class DatabaseManager:
                             max_warnings INTEGER DEFAULT 3,
                             anti_flood_enabled BOOLEAN DEFAULT TRUE,
                             protect_comments BOOLEAN DEFAULT TRUE,
+                            message_cooldown_enabled BOOLEAN DEFAULT FALSE,
+                            captcha_enabled BOOLEAN DEFAULT TRUE,
+                            captcha_type VARCHAR(20) DEFAULT 'button',
+                            captcha_timeout_minutes INTEGER DEFAULT 10,
+                            captcha_max_attempts INTEGER DEFAULT 3,
+                            captcha_policy VARCHAR(20) DEFAULT 'persistent',
+                            captcha_valid_days INTEGER DEFAULT 30,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     ''')
@@ -183,7 +195,9 @@ class DatabaseManager:
                             'captcha_enabled': bool(result[columns.index('captcha_enabled')]) if 'captcha_enabled' in columns else False,
                             'captcha_type': str(result[columns.index('captcha_type')]) if 'captcha_type' in columns else 'button',
                             'captcha_timeout_minutes': int(result[columns.index('captcha_timeout_minutes')]) if 'captcha_timeout_minutes' in columns else 10,
-                            'captcha_max_attempts': int(result[columns.index('captcha_max_attempts')]) if 'captcha_max_attempts' in columns else 3
+                            'captcha_max_attempts': int(result[columns.index('captcha_max_attempts')]) if 'captcha_max_attempts' in columns else 3,
+                            'captcha_policy': str(result[columns.index('captcha_policy')]) if 'captcha_policy' in columns else 'persistent',
+                            'captcha_valid_days': int(result[columns.index('captcha_valid_days')]) if 'captcha_valid_days' in columns else 30
                         }
 
                         logger.info(f"Загруженные настройки captcha_enabled: {settings.get('captcha_enabled')}")
@@ -202,10 +216,12 @@ class DatabaseManager:
                             'anti_flood_enabled': True,
                             'protect_comments': True,
                             'message_cooldown_enabled': False,
-                            'captcha_enabled': False,
+                            'captcha_enabled': True,
                             'captcha_type': 'button',
                             'captcha_timeout_minutes': 10,
-                            'captcha_max_attempts': 3
+                            'captcha_max_attempts': 3,
+                            'captcha_policy': 'persistent',
+                            'captcha_valid_days': 30
                         }
                         self.save_chat_settings(default_settings)
                         return default_settings
@@ -216,7 +232,7 @@ class DatabaseManager:
     def save_chat_settings(self, settings: Dict[str, Any]) -> None:
         """Сохранение настроек чата"""
         try:
-            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, captcha_enabled: {settings.get('captcha_enabled')}")
+            logger.info(f"Сохранение настроек для чата {settings['chat_id']}, captcha_enabled: {settings.get('captcha_enabled')}, policy: {settings.get('captcha_policy')}")
 
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
@@ -225,8 +241,9 @@ class DatabaseManager:
                         (chat_id, welcome_message, min_account_age_days, min_join_date_days, 
                          restrict_new_users, delete_service_messages, enabled, max_warnings, 
                          anti_flood_enabled, protect_comments, message_cooldown_enabled,
-                         captcha_enabled, captcha_type, captcha_timeout_minutes, captcha_max_attempts)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         captcha_enabled, captcha_type, captcha_timeout_minutes, captcha_max_attempts,
+                         captcha_policy, captcha_valid_days)  -- НОВЫЕ ПОЛЯ
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (chat_id) DO UPDATE SET
                         welcome_message = EXCLUDED.welcome_message,
                         min_account_age_days = EXCLUDED.min_account_age_days,
@@ -241,7 +258,9 @@ class DatabaseManager:
                         captcha_enabled = EXCLUDED.captcha_enabled,
                         captcha_type = EXCLUDED.captcha_type,
                         captcha_timeout_minutes = EXCLUDED.captcha_timeout_minutes,
-                        captcha_max_attempts = EXCLUDED.captcha_max_attempts
+                        captcha_max_attempts = EXCLUDED.captcha_max_attempts,
+                        captcha_policy = EXCLUDED.captcha_policy,  -- НОВОЕ ПОЛЕ
+                        captcha_valid_days = EXCLUDED.captcha_valid_days  -- НОВОЕ ПОЛЕ
                     ''', (
                         settings['chat_id'],
                         settings['welcome_message'],
@@ -257,7 +276,9 @@ class DatabaseManager:
                         settings.get('captcha_enabled'),
                         settings.get('captcha_type', 'button'),
                         settings.get('captcha_timeout_minutes', 10),
-                        settings.get('captcha_max_attempts', 3)
+                        settings.get('captcha_max_attempts', 3),
+                        settings.get('captcha_policy', 'persistent'),  # НОВОЕ ПОЛЕ
+                        settings.get('captcha_valid_days', 30)  # НОВОЕ ПОЛЕ
                     ))
                     conn.commit()
                     logger.info("Настройки успешно сохранены в БД")
@@ -501,7 +522,7 @@ class DatabaseManager:
                 with conn.cursor() as cursor:
                     # Удаляем старые записи
                     cursor.execute(
-                        'DELETE FROM flood_control WHERE last_message < CURRENT_TIMESTAMP - INTERVAL %s SECOND',
+                        'DELETE FROM flood_control WHERE last_message < NOW() - INTERVAL %s SECOND',
                         (time_window,)
                     )
                     
@@ -556,10 +577,12 @@ class DatabaseManager:
                     columns_to_check = [
                         ('protect_comments', 'BOOLEAN DEFAULT TRUE'),
                         ('message_cooldown_enabled', 'BOOLEAN DEFAULT FALSE'),
-                        ('captcha_enabled', 'BOOLEAN DEFAULT FALSE'),  # Новая настройка
+                        ('captcha_enabled', 'BOOLEAN DEFAULT TRUE'),  # Новая настройка
                         ('captcha_type', 'VARCHAR(20) DEFAULT \'button\''),  # Тип капчи
                         ('captcha_timeout_minutes', 'INTEGER DEFAULT 10'),  # Таймаут капчи
-                        ('captcha_max_attempts', 'INTEGER DEFAULT 3')  # Макс попыток
+                        ('captcha_max_attempts', 'INTEGER DEFAULT 3'),  # Макс попыток
+                        ('captcha_policy', 'VARCHAR(20) DEFAULT \'persistent\''),  # НОВОЕ ПОЛЕ
+                        ('captcha_valid_days', 'INTEGER DEFAULT 30')
                     ]
 
                     for column_name, column_type in columns_to_check:
@@ -577,6 +600,34 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error updating database schema: {e}")
     
+    
+    
+    def check_captcha_passed_recently(self, chat_id: int, user_id: int, days: int = 30) -> bool:
+        """Проверка, прошел ли пользователь капчу в течение указанного количества дней"""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Удаляем просроченные капчи
+                    cursor.execute('DELETE FROM user_captcha WHERE expires_at < CURRENT_TIMESTAMP')
+
+                    cursor.execute('''
+                        SELECT captcha_passed, created_at FROM user_captcha 
+                        WHERE chat_id = %s AND user_id = %s
+                        AND created_at >= CURRENT_TIMESTAMP - INTERVAL %s DAY
+                    ''', (chat_id, user_id, days))
+
+                    result = cursor.fetchone()
+                    if result:
+                        passed, created_at = result
+                        logger.info(f"Проверка капчи за {days} дней для {user_id}: passed={passed}, created={created_at}")
+                        return passed
+                    else:
+                        logger.info(f"Проверка капчи за {days} дней для {user_id}: запись не найдена или устарела")
+                        return False
+        except Exception as e:
+            logger.error(f"Error checking recent captcha: {e}")
+            return False
+
     def check_table_structure(self):
         """Проверка структуры таблицы chat_settings"""
         try:
@@ -1736,6 +1787,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 logger.error(f"Error saving captcha settings: {save_error}")
                 await query.answer("❌ Ошибка при сохранении настроек", show_alert=True)
         return
+    elif data == "captcha_policy_settings":
+        await show_captcha_policy_settings(update, context, chat_id, message_id)
+        return
+    elif data.startswith("captcha_policy_"):
+        policy = data.split("_")[2]  # persistent, time_based, always
+        settings_data = db.get_chat_settings(chat_id)
+        if settings_data:
+            settings_data['captcha_policy'] = policy
+            db.save_chat_settings(settings_data)
+            policy_names = {
+                'persistent': 'Постоянная',
+                'time_based': 'Временная', 
+                'always': 'Всегда'
+            }
+            await query.answer(f"✅ Установлена политика: {policy_names.get(policy, policy)}")
+            await show_captcha_policy_settings(update, context, chat_id, message_id)
+        return
+    elif data in ["increase_valid_days", "decrease_valid_days"]:
+        settings_data = db.get_chat_settings(chat_id)
+        if settings_data:
+            current_days = settings_data.get('captcha_valid_days', 30)
+            if data == "increase_valid_days":
+                new_days = min(365, current_days + 1)
+            else:
+                new_days = max(1, current_days - 1)
+
+            settings_data['captcha_valid_days'] = new_days
+            db.save_chat_settings(settings_data)
+            await query.answer(f"✅ Срок действия: {new_days} дней")
+            await show_captcha_policy_settings(update, context, chat_id, message_id)
+        return
     elif data == "reset_all_warnings":
         # Сброс всех предупреждений в чате
         # Здесь должна быть логика сброса всех предупреждений
@@ -1909,6 +1991,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Возвращаемся к меню настроек приветствий
             if message_id:
                 await show_welcome_settings(update, context, chat_id, message_id)
+
+def should_show_captcha(chat_id: int, user_id: int) -> bool:
+        """Определяет, нужно ли показывать капчу пользователю"""
+        try:
+            settings = db.get_chat_settings(chat_id)
+
+            if not settings or not settings.get('captcha_enabled', False):
+                return False
+
+            policy = settings.get('captcha_policy', CaptchaPolicy.PERSISTENT)
+
+            if policy == CaptchaPolicy.ALWAYS:
+                logger.info(f"Политика ALWAYS: показываем капчу пользователю {user_id}")
+                return True
+            elif policy == CaptchaPolicy.TIME_BASED:
+                days_valid = settings.get('captcha_valid_days', 30)
+                captcha_passed = db.check_captcha_passed_recently(chat_id, user_id, days_valid)
+                logger.info(f"Политика TIME_BASED ({days_valid} дней): пользователь {user_id} прошел капчу: {not captcha_passed}")
+                return not captcha_passed
+            else:  # PERSISTENT
+                captcha_passed = db.check_captcha_passed(chat_id, user_id)
+                logger.info(f"Политика PERSISTENT: пользователь {user_id} прошел капчу: {not captcha_passed}")
+                return not captcha_passed
+
+        except Exception as e:
+            logger.error(f"Error in should_show_captcha: {e}")
+            return True  # В случае ошибки показываем капчу для безопасности
                 
 async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик новых участников с улучшенной логикой капчи"""
@@ -1950,45 +2059,60 @@ async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     except Exception as e:
                         logger.error(f"Error kicking user: {e}")
         
-        # Улучшенная проверка капчи
+        # Улучшенная проверка капчи с использованием политик
         captcha_enabled = settings_data.get('captcha_enabled', False)
         logger.info(f"КАПЧА ДЛЯ ПОЛЬЗОВАТЕЛЯ {member.id}: {captcha_enabled}")
         
         if captcha_enabled:
             user_name = member.first_name or 'Пользователь'
-            # Проверяем, не прошел ли уже пользователь капчу
-            captcha_passed = db.check_captcha_passed(chat.id, member.id)
             
-            if not captcha_passed:
+            # Используем новую функцию для определения необходимости капчи
+            should_show = should_show_captcha(chat.id, member.id)
+            
+            if should_show:
+                logger.info(f"Пользователь {member.id} должен пройти капчу (политика: {settings_data.get('captcha_policy', 'persistent')})")
                 await send_captcha(update, context, chat.id, member.id, user_name)
-                continue  # Пропускаем приветствие если есть капча
-        
-        # Стандартное приветствие (если капча отключена или уже пройдена)
-        if settings_data['welcome_message']:
-            welcome_text = settings_data['welcome_message']
-            
-            user_name = member.first_name or 'Пользователь'
-            user_mention = f'<a href="tg://user?id={member.id}">{user_name}</a>'
-            chat_title = chat.title or 'чат'
-            
-            welcome_text = welcome_text.replace('{name}', user_name)
-            welcome_text = welcome_text.replace('{mention}', user_mention)
-            welcome_text = welcome_text.replace('{chat}', chat_title)
-            welcome_text = welcome_text.replace('{rules}', 'правилами')
-            
-            try:
-                await message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
-                db.log_action(chat.id, member.id, 'welcome_sent')
-            except Exception as e:
-                logger.error(f"Error sending welcome message: {e}")
+            else:
+                logger.info(f"Пользователь {member.id} уже прошел капчу или не требует проверки")
+                # Отправляем стандартное приветствие
+                if settings_data['welcome_message']:
+                    await send_welcome_message(chat, member, settings_data, context)
+        else:
+            # Если капча отключена, отправляем стандартное приветствие
+            if settings_data['welcome_message']:
+                await send_welcome_message(chat, member, settings_data, context)
     
-    # Удаление сервисного сообщения (всегда, независимо от тихого режима)
-    # if settings_data['delete_service_messages']:
-    #     try:
-    #         await message.delete()
-    #         db.log_action(chat.id, None, 'service_message_deleted')
-        # except Exception as e:
-        #     logger.error(f"Error deleting service message: {e}")
+    # Удаление сервисного сообщения (если включено в настройках)
+    if settings_data['delete_service_messages']:
+        try:
+            await message.delete()
+            db.log_action(chat.id, None, 'service_message_deleted')
+        except Exception as e:
+            logger.error(f"Error deleting service message: {e}")
+            
+async def send_welcome_message(chat: Chat, member: User, settings_data: Dict[str, Any], context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка стандартного приветственного сообщения"""
+    if settings_data['welcome_message']:
+        welcome_text = settings_data['welcome_message']
+        
+        user_name = member.first_name or 'Пользователь'
+        user_mention = f'<a href="tg://user?id={member.id}">{user_name}</a>'
+        chat_title = chat.title or 'чат'
+        
+        welcome_text = welcome_text.replace('{name}', user_name)
+        welcome_text = welcome_text.replace('{mention}', user_mention)
+        welcome_text = welcome_text.replace('{chat}', chat_title)
+        welcome_text = welcome_text.replace('{rules}', 'правилами')
+        
+        try:
+            await context.bot.send_message(
+                chat.id,
+                welcome_text,
+                parse_mode=ParseMode.HTML
+            )
+            db.log_action(chat.id, member.id, 'welcome_sent')
+        except Exception as e:
+            logger.error(f"Error sending welcome message: {e}")
 
 async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для проверки структуры базы данных"""
@@ -2102,6 +2226,78 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error(f"Error in error handler: {e}")
 
+async def show_captcha_policy_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
+    """Настройки политик капчи"""
+    settings_data = db.get_chat_settings(chat_id)
+    if not settings_data:
+        return
+    
+    current_policy = settings_data.get('captcha_policy', 'persistent')
+    valid_days = settings_data.get('captcha_valid_days', 30)
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔄 Постоянная" + (" ✅" if current_policy == CaptchaPolicy.PERSISTENT else ""), 
+                callback_data="captcha_policy_persistent"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⏰ Временная" + (" ✅" if current_policy == CaptchaPolicy.TIME_BASED else ""), 
+                callback_data="captcha_policy_time_based"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🚫 Всегда" + (" ✅" if current_policy == CaptchaPolicy.ALWAYS else ""), 
+                callback_data="captcha_policy_always"
+            )
+        ],
+        [
+            InlineKeyboardButton("➖ Дни", callback_data="decrease_valid_days"),
+            InlineKeyboardButton(f"Действует: {valid_days} дн.", callback_data="noop"),
+            InlineKeyboardButton("➕ Дни", callback_data="increase_valid_days")
+        ],
+        [
+            InlineKeyboardButton("◀️ Назад", callback_data="captcha_settings"),
+            InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    policy_descriptions = {
+        CaptchaPolicy.PERSISTENT: "✅ <b>Постоянная верификация</b>\n• Пользователь проходит капчу один раз\n• При повторном входе капча не требуется\n• <i>Рекомендуется для большинства чатов</i>",
+        CaptchaPolicy.TIME_BASED: "⏰ <b>Временная верификация</b>\n• Капча действует ограниченное время\n• После истечения срока - повторная проверка\n• <i>Для чатов с повышенной безопасностью</i>",
+        CaptchaPolicy.ALWAYS: "🚫 <b>Всегда показывать капчу</b>\n• Капча при каждом входе в чат\n• Максимальная безопасность\n• <i>Может раздражать пользователей</i>"
+    }
+    
+    text = (
+        f"🎛️ <b>Настройки политики капчи</b>\n\n"
+        f"{policy_descriptions.get(current_policy, '')}\n\n"
+        
+        f"<b>Текущая политика:</b> <code>{current_policy}</code>\n"
+        f"<b>Срок действия:</b> <code>{valid_days} дней</code>\n\n"
+        
+        f"💡 <i>Выберите политику проверки пользователей:</i>"
+    )
+    
+    if message_id:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
 
 async def show_bot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int] = None) -> None:
     """Показать список команд бота"""
@@ -2368,7 +2564,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(chat_info, parse_mode=ParseMode.HTML)
 
 async def handle_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик всех текстовых сообщений (комментариев и обычных сообщений)"""
+    """Обработчик ВСЕХ текстовых сообщений (комментариев и обычных сообщений)"""
     try:
         message = update.message
         if not message:
@@ -2380,6 +2576,26 @@ async def handle_comments(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat_id = message.chat_id
         user_id = message.from_user.id
+
+        if context.user_data and context.user_data.get('awaiting_welcome'):
+            welcome_message = message.text
+            if welcome_message:
+                settings_data = db.get_chat_settings(chat_id)
+                if settings_data:
+                    settings_data['welcome_message'] = welcome_message
+                    db.save_chat_settings(settings_data)
+                    
+                    del context.user_data['awaiting_welcome']
+                    message_id = context.user_data.get('settings_message_id')
+                    if 'settings_message_id' in context.user_data:
+                        del context.user_data['settings_message_id']
+                        
+                    await message.reply_text("✅ Приветственное сообщение обновлено!")
+                    
+                    # Возвращаемся к меню настроек приветствий
+                    if message_id:
+                        await show_welcome_settings(update, context, chat_id, message_id)
+            return
 
         settings = db.get_chat_settings(chat_id)
         if not settings or not settings['enabled']:
@@ -3061,9 +3277,7 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
             success = db.mark_captcha_passed(chat_id, user_id)
             
             if success:
-                # ВОССТАНОВЛЕНИЕ ПРАВ - МИНИМАЛЬНЫЙ ФОРМАТ
                 try:
-                    # Используем только can_send_messages для старых версий
                     await context.bot.restrict_chat_member(
                         chat_id=chat_id,
                         user_id=user_id,
@@ -3075,21 +3289,6 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
                     
                 except Exception as e:
                     logger.error(f"❌ Error unrestricting user {user_id}: {e}")
-                    # Попробуем альтернативный способ - снять все ограничения
-                    try:
-                        await context.bot.restrict_chat_member(
-                            chat_id=chat_id,
-                            user_id=user_id,
-                            permissions=ChatPermissions(
-                                can_send_messages=True,
-                                can_send_media_messages=True,
-                                can_send_other_messages=True,
-                                can_add_web_page_previews=True
-                            )
-                        )
-                        logger.info(f"✅ Rights restored (alternative method) for user {user_id}")
-                    except Exception as e2:
-                        logger.error(f"❌ Alternative unrestrict also failed: {e2}")
 
                 # Редактируем сообщение с капчей
                 try:
@@ -3211,6 +3410,7 @@ async def show_captcha_settings(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("⏰ Таймаут: 10 мин", callback_data="noop"),
             InlineKeyboardButton("🔄 Попытки: 3", callback_data="noop")
         ],
+        [InlineKeyboardButton("🎛️ Настройки политики", callback_data="captcha_policy_settings")],  # НОВАЯ КНОПКА
         [
             InlineKeyboardButton("◀️ Назад", callback_data="main_settings"),
             InlineKeyboardButton("🏠 В главное", callback_data="main_menu")
@@ -3237,13 +3437,21 @@ async def show_captcha_settings(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Error getting captcha stats: {e}")
         total, passed, failed = 0, 0, 0
     
+    current_policy = settings_data.get('captcha_policy', 'persistent')
+    policy_names = {
+        'persistent': '🔄 Постоянная',
+        'time_based': '⏰ Временная',
+        'always': '🚫 Всегда'
+    }
+    
     # Добавляем временную метку для уникальности сообщения
     timestamp = datetime.now().strftime("%H:%M:%S")
     
     text = (
         f"🤖 <b>Настройки капчи</b>\n\n"
         
-        f"<b>Текущий статус:</b> {'🟢 ВКЛЮЧЕНА' if settings_data.get('captcha_enabled', False) else '🔴 ВЫКЛЮЧЕНА'}\n\n"
+        f"<b>Текущий статус:</b> {'🟢 ВКЛЮЧЕНА' if settings_data.get('captcha_enabled', False) else '🔴 ВЫКЛЮЧЕНА'}\n"
+        f"<b>Политика:</b> {policy_names.get(current_policy, '🔄 Постоянная')}\n\n"
         
         f"<b>📊 Статистика капчи:</b>\n"
         f"• Всего проверок: <b>{total}</b>\n"
@@ -3262,7 +3470,7 @@ async def show_captcha_settings(update: Update, context: ContextTypes.DEFAULT_TY
         f"• При успехе - полный доступ к чату\n\n"
         
         f"💡 <i>Эффективно против ботов и спамеров</i>\n"
-        f"<i>Обновлено: {timestamp}</i>"  # Добавляем временную метку
+        f"<i>Обновлено: {timestamp}</i>"
     )
     
     if message_id:
